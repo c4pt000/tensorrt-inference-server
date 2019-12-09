@@ -382,6 +382,7 @@ if(${TRTIS_ENABLE_TENSORFLOW})
   target_link_libraries(
     trtserver
     PUBLIC ${TRTIS_EXTRA_LDFLAGS}
+    PUBLIC -lforestprotos
     PUBLIC -ltensorflow_cc
   )
 endif() # TRTIS_ENABLE_TENSORFLOW
