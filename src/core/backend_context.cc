@@ -213,6 +213,73 @@ BackendContext::SetFixedSizeOutputBuffer(
   return cuda_copy;
 }
 
+bool
+BackendContext::SetOutputShapeTensorBuffer(
+    const std::string& name, const int32_t* content,
+    const std::vector<int64_t>& content_shape, const bool support_batching,
+    TRTSERVER_Memory_Type src_memory_type, int64_t src_memory_type_id,
+    std::vector<Scheduler::Payload>* payloads)
+{
+  if (content_shape.empty()) {
+    return false;
+  }
+
+  bool cuda_copy = false;
+  int nb_shape_values = content_shape[0];
+  size_t content_offset = 0;
+  for (auto& payload : *payloads) {
+    const InferRequestHeader& request_header =
+        payload.request_provider_->RequestHeader();
+    const size_t expected_byte_size =
+        (nb_shape_values + (support_batching ? 1 : 0)) * sizeof(int32_t);
+
+    // If 'payload' should have valid output (status ok) and
+    // if 'payload' requested this output then copy it from
+    // 'content'. If it did not request this output then just
+    // skip it in the 'content'.
+    if (payload.status_.IsOk() && (payload.response_provider_ != nullptr) &&
+        payload.response_provider_->RequiresOutput(name)) {
+      auto dst_memory_type = src_memory_type;
+      int64_t dst_memory_type_id;
+      void* buffer = nullptr;
+
+      // try to get buffer with the same memory type as the output tensor
+      Status status = payload.response_provider_->AllocateOutputBuffer(
+          name, &buffer, expected_byte_size, content_shape, src_memory_type,
+          src_memory_type_id, &dst_memory_type, &dst_memory_type_id);
+      if (status.IsOk() && (expected_byte_size != 0)) {
+        if (buffer == nullptr) {
+          status = Status(
+              RequestStatusCode::INTERNAL,
+              "failed to allocate buffer for output '" + name + "'");
+        } else {
+          bool cuda_used = false;
+          if (support_batching) {
+            content_offset = 1;
+            // The first shape value must be the batch size
+            int32_t bs = request_header.batch_size();
+            status = CopyBuffer(
+                name, src_memory_type, src_memory_type_id, dst_memory_type,
+                dst_memory_type_id, sizeof(int32_t), &bs, buffer, stream_,
+                &cuda_used);
+          }
+          //  Copy out the rest of the shape values
+          status = CopyBuffer(
+              name, src_memory_type, src_memory_type_id, dst_memory_type,
+              dst_memory_type_id, expected_byte_size, content + content_offset,
+              buffer, stream_, &cuda_used);
+          cuda_copy |= cuda_used;
+        }
+      }
+
+      payload.status_ = status;
+    }
+  }
+
+  return cuda_copy;
+}
+
+
 Status
 BackendContext::GetContiguousInputContent(
     const std::string& name, TRTSERVER_Memory_Type memory_type,
