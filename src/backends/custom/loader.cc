@@ -74,7 +74,7 @@ LoadCustom(
   *custom_version = 0;
 
   // Load the custom library
-  void* handle = dlopen(path.c_str(), RTLD_LAZY);
+  void* handle = dlopen(path.c_str(), RTLD_LAZY | RTLD_DEEPBIND);
   if (handle == nullptr) {
     return Status(
         RequestStatusCode::NOT_FOUND,
