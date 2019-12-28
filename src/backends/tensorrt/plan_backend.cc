@@ -27,6 +27,7 @@
 #include "src/backends/tensorrt/plan_backend.h"
 
 #include <NvInfer.h>
+#include <condition_variable>
 #include <stdint.h>
 #include <mutex>
 #include "src/backends/tensorrt/loader.h"
@@ -881,7 +882,7 @@ PlanBackend::Run(
     OnCompleteQueuedPayloads(Status(
         RequestStatusCode::INTERNAL,
         "unexpected runner index" + std::to_string(runner_idx) +
-            ", max allowed " + std::to_string(context_map_.size())));
+            ", max allowed " + std::to_string(device_context_map_.size())));
     return;
   }
 
