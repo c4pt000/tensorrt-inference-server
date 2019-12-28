@@ -40,6 +40,43 @@
 
 namespace nvidia { namespace inferenceserver {
 
+//
+// C++11 doesn't have a sync queue so we implement a simple one.
+//
+template<typename Item>
+class SyncQueue {
+ public:
+  SyncQueue() : {}
+
+  bool Empty() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return queue_.empty();
+  }
+
+  Item Get() {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (queue_.empty()) {
+      cv_.wait(lk, [this] { return !queue_.empty(); });
+    }
+    auto res = queue_.front();
+    queue_.pop_front();
+    return res;
+  }
+
+  void Put(const Item& value) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      queue_.push_back(value);
+    }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<Item> queue_;
+};
+
 PlanBackend::Context::Context(
     const std::string& name, const int gpu_device, const int max_batch_size)
     : BackendContext(name, gpu_device, max_batch_size), runtime_(nullptr),
@@ -115,8 +152,6 @@ PlanBackend::CreateExecutionContexts(
   static std::mutex global_context_mu;
   std::lock_guard<std::mutex> glock(global_context_mu);
 
-  uint32_t total_context_cnt = 0;
-
   // Create a runtime/engine/context trifecta for each instance.
   //
   // TODO [DLIS-14] This can be optimized by sharing a runtime (across
@@ -140,16 +175,25 @@ PlanBackend::CreateExecutionContexts(
 
         RETURN_IF_ERROR(CreateExecutionContext(
             instance_name, gpu_device, models, group.profile()));
-        total_context_cnt++;
+
+        // Initialize all key-value pair in advance so that the map
+        // can be mutex-free.
+        next_context_[gpu_device] = -1;
+        // The last entry in contexts_ is the newly created context
+        device_context_map_[gpu_device].Put(contexts_.size() - 1);
       }
     }
   }
 
-  // Create a scheduler with one thread for each context available for
-  // this model. Each runner is exclusively tied to the context.
+  // Create a scheduler with one thread for each GPU specified for
+  // this model. Each runner is responsible to dispatch tasks to contexts
+  // associated with the corresponding GPU.
   RETURN_IF_ERROR(SetConfiguredScheduler(
-      total_context_cnt,
-      [](uint32_t runner_idx) -> Status { return Status::Success; },
+      device_context_map_.size(),
+      [this](uint32_t runner_idx) -> Status {
+        // Obtain any context as the next context for the corresponding device
+        next_context_[runner_idx] = device_context_map_[runner_idx].Get();
+        return Status::Success; },
       [this](
           uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
           std::function<void(Status)> func) {
@@ -826,6 +870,58 @@ PlanBackend::Context::BuildCudaGraph(
   return captured;
 }
 #endif
+
+void
+PlanBackend::Run(
+    uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
+    std::function<void(Status)> OnCompleteQueuedPayloads)
+{
+  // Each runner executes using the corresponding context...
+  if (runner_idx >= device_context_map_.size()) {
+    OnCompleteQueuedPayloads(Status(
+        RequestStatusCode::INTERNAL,
+        "unexpected runner index" + std::to_string(runner_idx) +
+            ", max allowed " + std::to_string(context_map_.size())));
+    return;
+  }
+
+#ifdef TRTIS_ENABLE_STATS
+  // Stop queue timer and start compute timer when the payload is
+  // scheduled to run
+  for (auto& payload : *payloads) {
+    if (payload.stats_ != nullptr) {
+      payload.stats_->CaptureTimestamp(
+          ModelInferStats::TimestampKind::kComputeStart);
+      payload.stats_->SetGPUDevice(runner_idx);
+    }
+  }
+#endif  // TRTIS_ENABLE_STATS
+
+  // [TODO] multiple instances per device will not work until the Run()
+  // is enhanced
+  // [TODO] wrap 'OnCompleteQueuedPayloads' in a CUDA callback
+  // since run will not be blocked here
+  auto status = contexts_[next_context_[runner_idx]]->Run(this, payloads);
+
+  // [TODO] this should be done in other places where completion is being handled
+  device_context_map_[runner_idx].Put(next_context_[runner_idx]);
+
+#ifdef TRTIS_ENABLE_STATS
+  // Stop compute timers.
+  for (auto& payload : *payloads) {
+    if (payload.stats_ != nullptr) {
+      payload.stats_->CaptureTimestamp(
+          ModelInferStats::TimestampKind::kComputeEnd);
+    }
+  }
+#endif  // TRTIS_ENABLE_STATS
+
+  OnCompleteQueuedPayloads(status);
+
+  // Set the next context to be executed on this runner, will block
+  // until there is available context for the runner
+  next_context_[runner_idx] = device_context_map_[runner_idx].Get();
+}
 
 Status
 PlanBackend::Context::Run(

@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include <deque>
 #include <NvInfer.h>
 #include <cuda_runtime_api.h>
 #include "src/core/backend.h"
@@ -35,10 +36,16 @@
 
 namespace nvidia { namespace inferenceserver {
 
+template<typename Item>
+class SyncQueue;
 class PlanBackend : public InferenceBackend {
  public:
   PlanBackend() = default;
   PlanBackend(PlanBackend&&) = default;
+
+  void Run(
+      uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
+      std::function<void(Status)> OnCompleteQueuedPayloads) override;
 
   // Create a context for execution for each instance for the
   // serialized plans specified in 'models'.
@@ -155,6 +162,13 @@ class PlanBackend : public InferenceBackend {
     // The array size is equal to Context::total_bindings_
     std::vector<void*> buffer_bindings_;
   };
+
+  // map from device ID (runner) to a queue containing available contexts
+  // associated with the device
+  std::map<int, SyncQueue<size_t>> device_context_map_;
+
+  // Next context to be used for the device.
+  std::map<int, size_t> next_context_;
 };
 
 std::ostream& operator<<(std::ostream& out, const PlanBackend& pb);
